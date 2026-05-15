@@ -29,10 +29,8 @@ jobs:
       - name: Find BIOS file
         run: |
           echo "Searching for QEMU EFI BIOS..."
-          find /usr -name "*.bin" 2>/dev/null | grep -i efi || true
           find /usr -name "QEMU_EFI*" 2>/dev/null || true
-          ls /usr/share/qemu-efi-aarch64/ 2>/dev/null || echo "Directory not found"
-          ls /usr/share/ovmf/ 2>/dev/null || echo "ovmf dir not found"
+          find /usr -name "*.fd" 2>/dev/null | grep -i efi || true
 
       - name: Download Aluminium OS .img
         run: |
@@ -43,38 +41,33 @@ jobs:
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_TOKEN }}
         run: |
-          # Find the BIOS file dynamically
-          BIOS=$(find /usr -name "QEMU_EFI.fd" -o -name "QEMU_EFI.bin" 2>/dev/null | head -1)
+          # Find BIOS dynamically
+          BIOS=$(find /usr -name "QEMU_EFI.fd" 2>/dev/null | head -1)
           if [ -z "$BIOS" ]; then
-            BIOS=$(find /usr/share/qemu-efi-aarch64/ /usr/share/ovmf/ -name "*.bin" -o -name "*.fd" 2>/dev/null | head -1)
+            BIOS=$(find /usr -name "QEMU_EFI.bin" 2>/dev/null | head -1)
+          fi
+          if [ -z "$BIOS" ]; then
+            BIOS=$(find /usr/share/qemu-efi-aarch64/ /usr/share/ovmf/ -type f 2>/dev/null | head -1)
           fi
           echo "Using BIOS: $BIOS"
 
-          # Start virtual display
-          Xvfb :99 -screen 0 1280x720x24 &
-          export DISPLAY=:99
-          sleep 1
-
-          # Start VNC on port 5900
-          x11vnc -display :99 -nopw -listen 0.0.0.0 -xkb -forever -bg
+          # QEMU will use VNC display :1 = port 5901
+          # noVNC will proxy port 5901 and expose on 6080
+          websockify --web /usr/share/novnc/ 6080 localhost:5901 &
           sleep 2
 
-          # Start noVNC on port 6080
-          websockify --web /usr/share/novnc/ 6080 localhost:5900 &
-          sleep 2
-
-          # Start ngrok
+          # Start ngrok tunnel to noVNC on 6080
           ngrok http 6080 --log=stdout &
           sleep 6
 
-          # Print URL
+          # Print ngrok URL
           echo "========================================="
           echo "YOUR BROWSER URL:"
           curl -s http://localhost:4040/api/tunnels | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])"
           echo "Open in browser then click Connect!"
           echo "========================================="
 
-          # Boot QEMU - keep running so ngrok stays alive
+          # Boot QEMU with VNC on display :1 (port 5901)
           qemu-system-aarch64 \
             -machine virt \
             -cpu cortex-a57 \
@@ -85,6 +78,6 @@ jobs:
             -device usb-ehci \
             -device usb-kbd \
             -device usb-mouse \
-            -display vnc=:0 \
+            -display vnc=:1 \
             -bios $BIOS \
             -serial stdio
