@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       image_url:
-        description: 'Direct download URL to your .img file (Google Drive, Dropbox, etc)'
+        description: 'Direct download URL to your .img file'
         required: true
         type: string
 
@@ -17,7 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y qemu-system-aarch64 qemu-utils novnc websockify wget curl xvfb x11vnc tigervnc-standalone-server
+          sudo apt-get install -y qemu-system-aarch64 qemu-utils qemu-efi-aarch64 ovmf novnc websockify wget curl xvfb x11vnc
 
       - name: Install ngrok
         run: |
@@ -26,41 +26,55 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ngrok
 
+      - name: Find BIOS file
+        run: |
+          echo "Searching for QEMU EFI BIOS..."
+          find /usr -name "*.bin" 2>/dev/null | grep -i efi || true
+          find /usr -name "QEMU_EFI*" 2>/dev/null || true
+          ls /usr/share/qemu-efi-aarch64/ 2>/dev/null || echo "Directory not found"
+          ls /usr/share/ovmf/ 2>/dev/null || echo "ovmf dir not found"
+
       - name: Download Aluminium OS .img
         run: |
-          echo "Downloading image from provided URL..."
           wget -q --show-progress -O aluminium-os.img "${{ github.event.inputs.image_url }}"
-          echo "Download complete! File size:"
           ls -lh aluminium-os.img
 
       - name: Start noVNC + QEMU
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_TOKEN }}
         run: |
-          # Start a virtual display
+          # Find the BIOS file dynamically
+          BIOS=$(find /usr -name "QEMU_EFI.fd" -o -name "QEMU_EFI.bin" 2>/dev/null | head -1)
+          if [ -z "$BIOS" ]; then
+            BIOS=$(find /usr/share/qemu-efi-aarch64/ /usr/share/ovmf/ -name "*.bin" -o -name "*.fd" 2>/dev/null | head -1)
+          fi
+          echo "Using BIOS: $BIOS"
+
+          # Start virtual display
           Xvfb :99 -screen 0 1280x720x24 &
           export DISPLAY=:99
+          sleep 1
 
-          # Start VNC server on port 5900
-          x11vnc -display :99 -nopw -listen 0.0.0.0 -xkb -forever &
+          # Start VNC on port 5900
+          x11vnc -display :99 -nopw -listen 0.0.0.0 -xkb -forever -bg
           sleep 2
 
-          # Start noVNC websocket proxy on port 6080
+          # Start noVNC on port 6080
           websockify --web /usr/share/novnc/ 6080 localhost:5900 &
           sleep 2
 
-          # Start ngrok tunnel to port 6080
+          # Start ngrok
           ngrok http 6080 --log=stdout &
-          sleep 5
+          sleep 6
 
-          # Print the ngrok URL
+          # Print URL
           echo "========================================="
-          echo "YOUR BROWSER URL IS BELOW:"
+          echo "YOUR BROWSER URL:"
           curl -s http://localhost:4040/api/tunnels | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])"
-          echo "Open the URL above in your browser!"
+          echo "Open in browser then click Connect!"
           echo "========================================="
 
-          # Boot Aluminium OS in QEMU
+          # Boot QEMU - keep running so ngrok stays alive
           qemu-system-aarch64 \
             -machine virt \
             -cpu cortex-a57 \
@@ -71,6 +85,6 @@ jobs:
             -device usb-ehci \
             -device usb-kbd \
             -device usb-mouse \
-            -display sdl \
-            -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.bin \
-            -serial stdio || true
+            -display vnc=:0 \
+            -bios $BIOS \
+            -serial stdio
