@@ -1,88 +1,96 @@
-name: Boot Aluminium OS ARM64
+name: Boot LineageOS VirtIO ARM64 (KVM)
 
 on:
   workflow_dispatch:
     inputs:
-      image_url:
-        description: 'Direct download URL to your .img file'
-        required: true
+      release_tag:
+        description: 'Tag da release do jqssun (ex: v2026.02.02) ou deixe em branco para a mais recente'
+        required: false
         type: string
+        default: 'latest'
 
 jobs:
   boot:
-    runs-on: ubuntu-24.04-arm
+    runs-on: debian-arm64
     timeout-minutes: 355
-
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y qemu-system-aarch64 qemu-utils qemu-efi-aarch64 ovmf novnc websockify wget curl android-sdk-libsparse-utils
+          sudo apt-get install -y \
+            qemu-system-aarch64 qemu-utils qemu-efi-aarch64 ovmf \
+            novnc websockify wget curl jq unzip cpu-checker
 
-      - name: Install ngrok
+      - name: Check KVM Availability
         run: |
-          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt-get update -qq
-          sudo apt-get install -y ngrok
+          echo "Verificando suporte a virtualização via hardware..."
+          kvm-ok || true
+          ls -l /dev/kvm || true
+          sudo chmod 666 /dev/kvm || true
 
-      - name: Download Aluminium OS .img
+      - name: Download LineageOS VirtIO (jqssun)
         run: |
-          wget -q --show-progress -O aluminium-os-original.img "${{ github.event.inputs.image_url }}"
-          ls -lh aluminium-os-original.img
-
-      - name: Convert sparse image to raw
-        run: |
-          echo "Checking image type..."
-          file aluminium-os-original.img
-          # Try simg2img conversion (handles sparse Android images)
-          if simg2img aluminium-os-original.img aluminium-os.img 2>/dev/null; then
-            echo "Converted sparse image to raw successfully!"
+          echo "Buscando metadados da release do jqssun/android-lineage-qemu..."
+          if [ "${{ github.event.inputs.release_tag }}" = "latest" ] || [ -z "${{ github.event.inputs.release_tag }}" ]; then
+            API_URL="https://api.github.com/repos/jqssun/android-lineage-qemu/releases/latest"
           else
-            echo "Not a sparse image, using as-is"
-            cp aluminium-os-original.img aluminium-os.img
+            API_URL="https://api.github.com/repos/jqssun/android-lineage-qemu/releases/tags/${{ github.event.inputs.release_tag }}"
           fi
-          echo "Final image info:"
-          file aluminium-os.img
-          ls -lh aluminium-os.img
-          # Show partition table
-          fdisk -l aluminium-os.img || true
-          sgdisk -p aluminium-os.img || true
+
+          DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name | contains("arm64") and endswith(".zip")) | .browser_download_url' | head -n 1)
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            echo "Erro: Não foi possível encontrar o arquivo zip do LineageOS. Abortando."
+            exit 1
+          fi
+
+          echo "Baixando: $DOWNLOAD_URL"
+          wget -q --show-progress -O lineage-utm.zip "$DOWNLOAD_URL"
+          unzip lineage-utm.zip -d lineage_extracted
+
+          IMG_PATH=$(find lineage_extracted -name "*.img" | head -n 1)
+          if [ -z "$IMG_PATH" ]; then
+            IMG_PATH=$(find lineage_extracted -type f -size +1G | head -n 1)
+          fi
+
+          echo "Imagem encontrada: $IMG_PATH"
+          qemu-img convert -f raw -O qcow2 "$IMG_PATH" vda.qcow2
+          qemu-img create -f qcow2 vdb.qcow2 10G
+          ls -lh vda.qcow2 vdb.qcow2
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:github-actions
 
       - name: Start noVNC + QEMU
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_TOKEN }}
         run: |
-          # Find BIOS
           BIOS=$(find /usr -name "QEMU_EFI.fd" 2>/dev/null | head -1)
           if [ -z "$BIOS" ]; then
             BIOS=$(find /usr/share/qemu-efi-aarch64/ -type f 2>/dev/null | head -1)
           fi
           echo "Using BIOS: $BIOS"
 
-          # noVNC proxying QEMU VNC port 5901
-          websockify --web /usr/share/novnc/ 6080 localhost:5901 &
-          sleep 2
+          websockify --web /usr/share/novnc/ 6080 localhost:5901 & sleep 2
+          TAILSCALE_IP=$(tailscale ip -4)
 
-          # Start ngrok
-          ngrok http 6080 --log=stdout &
-          sleep 6
-
-          # Print URL with direct /vnc.html path
-          NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])")
           echo "========================================="
-          echo "OPEN THIS EXACT URL IN YOUR BROWSER:"
-          echo "$NGROK_URL/vnc.html?autoconnect=true&resize=scale"
+          echo "OPEN THIS EXACT URL FROM A DEVICE ON YOUR TAILSCALE NETWORK:"
+          echo "http://$TAILSCALE_IP:6080/vnc.html?autoconnect=true&resize=scale"
           echo "========================================="
 
-          # Boot QEMU
           qemu-system-aarch64 \
+            -enable-kvm \
             -machine virt \
-            -cpu cortex-a57 \
+            -cpu host \
             -smp 4 \
             -m 6G \
-            -drive file=aluminium-os.img,format=raw,if=virtio,id=hd0 \
-            -device virtio-gpu,xres=1280,yres=720 \
+            -drive file=vda.qcow2,format=qcow2,if=virtio,id=hd0 \
+            -drive file=vdb.qcow2,format=qcow2,if=virtio,id=hd1 \
+            -device virtio-gpu-pci,xres=1280,yres=720 \
+            -device virtio-net-pci,netdev=net0 \
+            -netdev user,id=net0 \
             -device usb-ehci \
             -device usb-kbd \
             -device usb-mouse \
