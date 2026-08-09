@@ -21,7 +21,9 @@ jobs:
       - name: Install dependencies
         run: |
           brew update
-          brew install qemu wget curl jq unzip websockify novnc
+          brew install qemu wget curl jq unzip novnc
+          pip3 install websockify
+
 
       - name: Download default images (if no GSI provided)
         if: ${{ inputs.gsi_url == '' }}
