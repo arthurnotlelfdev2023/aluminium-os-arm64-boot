@@ -1,13 +1,8 @@
-name: Boot LineageOS VirtIO ARM64 (KVM)
+name: Boot LineageOS VirtIO ARM64 (macOS HVF + Tailscale)
 
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: 'Tag da release do jqssun (ex: v2026.02.02) ou deixe em branco para a mais recente'
-        required: false
-        type: string
-        default: 'latest'
       gsi_url:
         description: 'Link direto para uma GSI (Generic System Image) opcional'
         required: false
@@ -16,58 +11,13 @@ on:
 
 jobs:
   boot:
-    runs-on: ubuntu-24.04-arm
+    runs-on: macos-latest
     timeout-minutes: 355
     steps:
       - name: Install dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            qemu-system-aarch64 qemu-utils qemu-efi-aarch64 ovmf \
-            novnc websockify wget curl jq unzip cpu-checker
-
-      - name: Check KVM Availability
-        run: |
-          echo "Verificando suporte a virtualização via hardware..."
-          kvm-ok || true
-          ls -l /dev/kvm || true
-          sudo chmod 666 /dev/kvm || true
-
-      - name: Download LineageOS VirtIO (jqssun)
-        run: |
-          if [ -n "${{ github.event.inputs.gsi_url }}" ]; then
-            echo "Baixando GSI personalizada..."
-            wget -q --show-progress -O gsi.img "${{ github.event.inputs.gsi_url }}"
-            qemu-img convert -f raw -O qcow2 gsi.img vda.qcow2
-          else
-            echo "Buscando metadados da release do jqssun/android-lineage-qemu..."
-            if [ "${{ github.event.inputs.release_tag }}" = "latest" ] || [ -z "${{ github.event.inputs.release_tag }}" ]; then
-              API_URL="https://api.github.com/repos/jqssun/android-lineage-qemu/releases/latest"
-            else
-              API_URL="https://api.github.com/repos/jqssun/android-lineage-qemu/releases/tags/${{ github.event.inputs.release_tag }}"
-            fi
-
-            DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name | contains("arm64") and endswith(".zip")) | .browser_download_url' | head -n 1)
-            if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
-              echo "Erro: Não foi possível encontrar o arquivo zip do LineageOS. Abortando."
-              exit 1
-            fi
-
-            echo "Baixando: $DOWNLOAD_URL"
-            wget -q --show-progress -O lineage-utm.zip "$DOWNLOAD_URL"
-            unzip lineage-utm.zip -d lineage_extracted
-
-            IMG_PATH=$(find lineage_extracted -name "*.img" | head -n 1)
-            if [ -z "$IMG_PATH" ]; then
-              IMG_PATH=$(find lineage_extracted -type f -size +1G | head -n 1)
-            fi
-
-            echo "Imagem encontrada: $IMG_PATH"
-            qemu-img convert -f raw -O qcow2 "$IMG_PATH" vda.qcow2
-          fi
-
-          qemu-img create -f qcow2 vdb.qcow2 10G
-          ls -lh vda.qcow2 vdb.qcow2
+          brew update
+          brew install qemu wget curl jq unzip websockify novnc
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@v2
@@ -76,15 +26,23 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:github-actions
 
-      - name: Start noVNC + QEMU
+      - name: Prepare Disk Images
         run: |
-          BIOS=$(find /usr -name "QEMU_EFI.fd" 2>/dev/null | head -1)
-          if [ -z "$BIOS" ]; then
-            BIOS=$(find /usr/share/qemu-efi-aarch64/ -type f 2>/dev/null | head -1)
+          if [ -n "${{ github.event.inputs.gsi_url }}" ]; then
+            echo "Baixando GSI personalizada..."
+            wget -q --show-progress -O gsi.img "${{ github.event.inputs.gsi_url }}"
+            qemu-img convert -f raw -O qcow2 gsi.img vda.qcow2
+          else
+            echo "Nenhuma GSI fornecida, criando disco vazio..."
+            qemu-img create -f qcow2 vda.qcow2 8G
           fi
-          echo "Using BIOS: $BIOS"
+          qemu-img create -f qcow2 vdb.qcow2 10G
+          ls -lh vda.qcow2 vdb.qcow2
 
-          websockify --web /usr/share/novnc/ 6080 localhost:5901 & sleep 2
+      - name: Start noVNC + QEMU (HVF)
+        run: |
+          # Inicializa proxy noVNC
+          websockify --web /usr/local/opt/novnc/share/novnc/ 6080 localhost:5901 & sleep 2
           TAILSCALE_IP=$(tailscale ip -4)
 
           echo "========================================="
@@ -93,8 +51,8 @@ jobs:
           echo "========================================="
 
           qemu-system-aarch64 \
-            -enable-kvm \
             -machine virt \
+            -accel hvf \
             -cpu host \
             -smp 4 \
             -m 6G \
@@ -107,6 +65,5 @@ jobs:
             -device usb-kbd \
             -device usb-mouse \
             -display vnc=:1 \
-            -bios $BIOS \
             -boot order=c,menu=off \
             -serial stdio
