@@ -13,58 +13,43 @@ jobs:
   boot:
     runs-on: macos-latest
     timeout-minutes: 355
+
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Install dependencies
         run: |
           brew update
           brew install qemu wget curl jq unzip websockify novnc
-          wget https://drive.google.com/uc?id=1PGYGqOcOsGB_vQgEdJP4eU83330TQ9oc&export=download
-          wget https://drive.google.com/uc?id=1G-IXUpp_40kUl7lCE1HP0Qsy0kB2qkJP&export=download
+
+      - name: Download default images (if no GSI provided)
+        if: ${{ inputs.gsi_url == '' }}
+        run: |
+          wget -O system.img "https://drive.google.com/uc?id=1PGYGqOcOsGB_vQgEdJP4eU83330TQ9oc&export=download"
+          wget -O vendor.img "https://drive.google.com/uc?id=1G-IXUpp_40kUl7lCE1HP0Qsy0kB2qkJP&export=download"
+
+      - name: Download provided GSI
+        if: ${{ inputs.gsi_url != '' }}
+        run: |
+          curl -L "${{ inputs.gsi_url }}" -o system.img
+
       - name: Connect to Tailscale
         uses: tailscale/github-action@v2
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:github-actions
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
 
-      - name: Prepare Disk Images
+      - name: Boot LineageOS with QEMU
         run: |
-          if [ -n "${{ github.event.inputs.gsi_url }}" ]; then
-            echo "Baixando GSI personalizada..."
-            wget -q --show-progress -O gsi.img "${{ github.event.inputs.gsi_url }}"
-            qemu-img convert -f raw -O qcow2 gsi.img vda.qcow2
-          else
-            echo "Nenhuma GSI fornecida, criando disco vazio..."
-            qemu-img create -f qcow2 vda.qcow2 8G
-          fi
-          qemu-img create -f qcow2 vdb.qcow2 10G
-          ls -lh vda.qcow2 vdb.qcow2
-
-      - name: Start noVNC + QEMU (HVF)
-        run: |
-          # Inicializa proxy noVNC
-          websockify --web /usr/local/opt/novnc/share/novnc/ 6080 localhost:5901 & sleep 2
-          TAILSCALE_IP=$(tailscale ip -4)
-
-          echo "========================================="
-          echo "OPEN THIS EXACT URL FROM A DEVICE ON YOUR TAILSCALE NETWORK:"
-          echo "http://$TAILSCALE_IP:6080/vnc.html?autoconnect=true&resize=scale"
-          echo "========================================="
-
           qemu-system-aarch64 \
-            -machine virt \
-            -accel hvf \
-            -cpu host \
+            -machine virt,accel=hvf \
+            -cpu cortex-a72 \
+            -m 4096 \
             -smp 4 \
-            -m 6G \
-            -drive file=vda.qcow2,format=qcow2,if=virtio,id=hd0 \
-            -drive file=vdb.qcow2,format=qcow2,if=virtio,id=hd1 \
-            -device virtio-gpu-pci,xres=1280,yres=720 \
             -device virtio-net-pci,netdev=net0 \
-            -netdev user,id=net0 \
-            -device usb-ehci \
-            -device usb-kbd \
-            -device usb-mouse \
-            -display vnc=:1 \
-            -boot order=c,menu=off \
-            -serial stdio
+            -netdev user,id=net0,hostfwd=tcp::5555-:5555 \
+            -drive if=none,file=system.img,format=raw,id=system \
+            -device virtio-blk-pci,drive=system \
+            -drive if=none,file=vendor.img,format=raw,id=vendor \
+            -device virtio-blk-pci,drive=vendor \
+            -nographic
