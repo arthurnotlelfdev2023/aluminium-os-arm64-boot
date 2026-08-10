@@ -1,0 +1,50 @@
+name: macOS Cloud PC with Tailscale
+
+on:
+  workflow_dispatch: # Permite iniciar o Cloud PC manualmente pela aba Actions do GitHub
+
+jobs:
+  macos-cloud-pc:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Instala o binário oficial do Tailscale via Homebrew de forma nativa
+      - name: Install Tailscale via Homebrew
+        run: |
+          brew install tailscale
+          # Registra e inicia o daemon de segundo plano (tailscaled) no macOS
+          sudo brew services start tailscale
+
+      # Autentica e levanta a conexão usando suas credenciais OAuth do repositório
+      - name: Connect to Tailscale (Native)
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          # Aguarda o daemon do sistema estar totalmente pronto
+          sleep 3
+          
+          # Autentica de forma não-interativa usando os parâmetros OAuth
+          sudo tailscale up \
+            --auth-key="${TS_OAUTH_SECRET}" \
+            --advertise-tags=tag:ci \
+            --accept-routes
+
+      - name: Configure macOS User Password
+        run: |
+          # Define 'password123' como a senha do usuário padrão 'runner'
+          echo "runner:password123" | sudo chpasswd
+
+      - name: Enable macOS Screen Sharing (VNC)
+        run: |
+          # Ativa o compartilhamento de tela nativo do macOS
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
+
+      - name: Keep Runner Alive
+        run: |
+          echo "macOS Cloud PC está rodando com sucesso!"
+          echo "Conecte via VNC usando o IP do Tailscale deste runner."
+          # Mantém o workflow ativo por 6 horas (limite máximo do GitHub Actions)
+          sleep 21600
